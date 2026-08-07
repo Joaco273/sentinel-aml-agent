@@ -1,6 +1,7 @@
 import os
 import datetime
 from typing import Dict, Any
+import dotenv
 from langgraph.types import interrupt
 
 from src.db.connection import SessionLocal
@@ -8,6 +9,9 @@ from src.db.models import Alert, Account, Transaction
 from src.tools.transaction_tools import fetch_transaction_history
 from src.tools.sanctions_tools import perform_sanctions_check
 from src.agent.schemas import AgentState, RiskAssessment
+
+# Load environment variables
+dotenv.load_dotenv()
 
 
 def get_utc_now():
@@ -139,19 +143,93 @@ def calculate_rule_risk_assessment(state: AgentState) -> RiskAssessment:
     )
 
 
+def evaluate_risk_with_gemini(state: AgentState) -> RiskAssessment:
+    """Evaluates risk score and rationale using Gemini LLM with structured output."""
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("Neither GEMINI_API_KEY nor GOOGLE_API_KEY is configured in environment.")
+
+    # Ensure GOOGLE_API_KEY is set in env for langchain_google_genai
+    if "GOOGLE_API_KEY" not in os.environ and api_key:
+        os.environ["GOOGLE_API_KEY"] = api_key
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0,
+        google_api_key=api_key
+    )
+
+    structured_llm = llm.with_structured_output(RiskAssessment)
+
+    alert_data = state.get("alert_data", {})
+    history = state.get("transaction_history", {})
+    sanctions = state.get("sanctions_check", {})
+
+    prompt = f"""You are a Senior Anti-Money Laundering (AML) Compliance Officer analyzing a suspicious transaction alert.
+Evaluate the data below and return a structured RiskAssessment with an integer risk_score between 0 and 100, key risk_factors, a comprehensive rationale, and a recommended_action ('HUMAN_REVIEW' if risk_score > 70 else 'AUTO_CLOSE').
+
+ALERT DATA:
+- Alert ID: {alert_data.get('alert_id')}
+- Account ID: {alert_data.get('account_id')}
+- Flagged Amount: ${alert_data.get('amount', 0.0):,.2f}
+- Trigger Reason: {alert_data.get('trigger_reason')}
+- IP Address: {alert_data.get('ip_address', 'N/A')}
+- Country: {alert_data.get('location_country', 'N/A')}
+- Counterparty: {alert_data.get('counterparty_name', 'N/A')}
+
+30-DAY HISTORICAL BASELINE:
+- Customer Name: {history.get('customer_name', 'N/A')}
+- Account Type: {history.get('account_type', 'N/A')}
+- Account Risk Tier: {history.get('risk_tier', 'N/A')}
+- 30-Day Average Transaction Size: ${history.get('30_day_avg_amount', 0.0):,.2f}
+- 30-Day Transaction Count: {history.get('30_day_frequency', 0)}
+- 30-Day Maximum Transaction: ${history.get('max_transaction_amount', 0.0):,.2f}
+- 30-Day Total Volume: ${history.get('total_volume', 0.0):,.2f}
+
+COMPLIANCE & SANCTIONS SCREENING:
+- Watchlist Match Status: {sanctions.get('status', 'CLEAR')}
+- Total Matches: {sanctions.get('match_count', 0)}
+- Highest Risk Level: {sanctions.get('highest_risk_level', 'NONE')}
+- Match Hits: {sanctions.get('matches', [])}
+
+SCORING CRITERIA:
+- High risk (>70): Severe baseline deviation, cash structuring, sanctioned entity match, or suspicious offshore IP.
+- Low risk (<=70): Minor baseline variance or routine standard transactions.
+"""
+
+    return structured_llm.invoke(prompt)
+
+
 def risk_scoring_node(state: AgentState) -> Dict[str, Any]:
     """Node 2: Risk Scoring Agent calculates risk score (0-100) & rationale."""
     logs = list(state.get("logs", []))
     logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] ⚖️ Risk Scoring Agent evaluating risk factors...")
 
-    # Calculate structured risk assessment
-    assessment = calculate_rule_risk_assessment(state)
+    # Check for Gemini API key and attempt LLM scoring with fallback
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    assessment = None
+    engine_used = "Rule Engine (Fallback)"
+
+    if api_key:
+        try:
+            logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] 🤖 Gemini LLM Engine active. Invoking gemini-2.5-flash...")
+            assessment = evaluate_risk_with_gemini(state)
+            engine_used = "Gemini LLM (gemini-2.5-flash)"
+        except Exception as e:
+            logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] ⚠️ Gemini API evaluation failed: {e}. Falling back to Rule Engine...")
+            assessment = calculate_rule_risk_assessment(state)
+            engine_used = "Rule Engine (Fallback after API error)"
+    else:
+        logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] ⚙️ GEMINI_API_KEY / GOOGLE_API_KEY not found in environment. Using Rule Engine fallback...")
+        assessment = calculate_rule_risk_assessment(state)
 
     score = assessment.risk_score
     rationale = assessment.rationale
     rec_action = assessment.recommended_action
 
-    logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] 🎯 Risk Assessment Complete -> Score: {score}/100 | Recommended Action: {rec_action}")
+    logs.append(f"[{get_utc_now().strftime('%H:%M:%S')}] 🎯 Risk Assessment Complete [{engine_used}] -> Score: {score}/100 | Recommended Action: {rec_action}")
     logs.append(f"   ↳ Rationale: {rationale}")
 
     # Update DB with risk score
